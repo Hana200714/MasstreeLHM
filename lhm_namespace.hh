@@ -2,8 +2,10 @@
 #define MASSTREELHM_LHM_NAMESPACE_HH
 
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <inttypes.h>
 #include <map>
@@ -173,6 +175,18 @@ class LhmNamespace {
         return fast_mode_;
     }
 
+    // L0 inode 缓冲开关：
+    // - true: 启用 L0+L1 两级缓存（更适合冷启动批量写）
+    // - false: 只启用 L1（更适合常规稳态测试）
+    bool set_l0_cache_enabled(bool enabled) {
+        l0_cache_enabled_ = enabled;
+        return persistent_store_.set_l0_cache_enabled(enabled);
+    }
+
+    bool l0_cache_enabled() const {
+        return l0_cache_enabled_;
+    }
+
     // lookup_entry 返回任意类型的命名空间项，根目录 "/" 被视为隐式存在。
     bool lookup_entry(const std::string& path, value_type& out, threadinfo& ti) const {
         ParsedPath parsed = PathKey::parse_absolute_path(path);
@@ -195,7 +209,14 @@ class LhmNamespace {
         return entry_is_directory(out);
     }
 
-    // mkdir 采用最小语义：父目录必须已存在，目标路径必须尚不存在。
+    // mkdir（推荐接口）：
+    // 调用方只提供路径，inode 引用由命名空间层自动分配。
+    bool mkdir(const std::string& path, threadinfo& ti) {
+        return mkdir(path, make_inode_ref(0, 0), ti);
+    }
+
+    // mkdir 兼容接口：
+    // 保留显式 ref 传参，主要用于旧测试/回放场景。
     bool mkdir(const std::string& path, inode_ref ref, threadinfo& ti) {
         ParsedPath parsed = PathKey::parse_absolute_path(path);
         if (parsed.normalized_path == "/" || parsed.components.empty()) {
@@ -211,11 +232,9 @@ class LhmNamespace {
             return false;
         }
 
-        inode_ref persistent_ref = ref;
-        if (persistence_available_) {
-            if (!persistent_store_.AllocateInodeSlot(persistent_ref)) {
-                return false;
-            }
+        inode_ref persistent_ref = make_inode_ref(0, 0);
+        if (!allocate_inode_ref_for_create(ref, persistent_ref)) {
+            return false;
         }
         if (!create_directory_on_parent_root(parsed, parent_root, persistent_ref, ti)) {
             return false;
@@ -223,7 +242,14 @@ class LhmNamespace {
         return persist_create_success(parsed, entry_kind::directory, persistent_ref, parent_ref);
     }
 
-    // creat_file 与 mkdir 类似，也要求父目录存在且目标路径尚不存在。
+    // creat_file（推荐接口）：
+    // 调用方只提供路径，inode 引用由命名空间层自动分配。
+    bool creat_file(const std::string& path, threadinfo& ti) {
+        return creat_file(path, make_inode_ref(0, 0), ti);
+    }
+
+    // creat_file 兼容接口：
+    // 保留显式 ref 传参，主要用于旧测试/回放场景。
     bool creat_file(const std::string& path, inode_ref ref, threadinfo& ti) {
         ParsedPath parsed = PathKey::parse_absolute_path(path);
         if (parsed.normalized_path == "/" || parsed.components.empty()) {
@@ -239,11 +265,9 @@ class LhmNamespace {
             return false;
         }
 
-        inode_ref persistent_ref = ref;
-        if (persistence_available_) {
-            if (!persistent_store_.AllocateInodeSlot(persistent_ref)) {
-                return false;
-            }
+        inode_ref persistent_ref = make_inode_ref(0, 0);
+        if (!allocate_inode_ref_for_create(ref, persistent_ref)) {
+            return false;
         }
         if (!create_file_on_parent_root(parsed, parent_root, persistent_ref, ti)) {
             return false;
@@ -253,6 +277,13 @@ class LhmNamespace {
 
     // 仅用于哈希碰撞测试：强制将最后一级路径分量替换成指定哈希值，
     // 用于观察“忽略碰撞模式”下的行为。
+    bool creat_file_with_forced_last_hash_for_test(const std::string& path,
+                                                   uint64_t forced_hash, threadinfo& ti) {
+        return creat_file_with_forced_last_hash_for_test(path, make_inode_ref(0, 0),
+                                                         forced_hash, ti);
+    }
+
+    // 兼容接口：保留显式 ref 注入能力，供旧测试代码继续使用。
     bool creat_file_with_forced_last_hash_for_test(const std::string& path, inode_ref ref,
                                                    uint64_t forced_hash, threadinfo& ti) {
         ParsedPath parsed = PathKey::parse_absolute_path(path);
@@ -270,11 +301,9 @@ class LhmNamespace {
             return false;
         }
 
-        inode_ref persistent_ref = ref;
-        if (persistence_available_) {
-            if (!persistent_store_.AllocateInodeSlot(persistent_ref)) {
-                return false;
-            }
+        inode_ref persistent_ref = make_inode_ref(0, 0);
+        if (!allocate_inode_ref_for_create(ref, persistent_ref)) {
+            return false;
         }
         if (!create_file_on_parent_root(parsed, parent_root, persistent_ref, ti)) {
             return false;
@@ -583,8 +612,10 @@ class LhmNamespace {
 
     table_type table_;
     bool fast_mode_ = true;
+    bool l0_cache_enabled_ = true;
     PersistentStore persistent_store_;
     bool persistence_available_ = false;
+    std::atomic<uint64_t> transient_inode_cursor_{1};
     inode_ref root_persistent_ref_ = make_inode_ref(0, 0);
     bool root_persistent_ref_valid_ = false;
 
@@ -727,15 +758,51 @@ class LhmNamespace {
         return (static_cast<uint64_t>(ref.block_id) << 32) | static_cast<uint64_t>(ref.offset);
     }
 
+    static bool is_zero_inode_ref(const inode_ref& ref) {
+        return ref.block_id == 0 && ref.offset == 0;
+    }
+
+    bool allocate_inode_ref_for_create(const inode_ref& requested_ref, inode_ref& out_ref) {
+        if (persistence_available_) {
+            return persistent_store_.AllocateInodeSlot(out_ref);
+        }
+
+        if (!is_zero_inode_ref(requested_ref)) {
+            out_ref = requested_ref;
+            return true;
+        }
+
+        uint64_t ticket = transient_inode_cursor_.fetch_add(1, std::memory_order_relaxed);
+        if (ticket == 0) {
+            ticket = transient_inode_cursor_.fetch_add(1, std::memory_order_relaxed);
+        }
+        out_ref.block_id = static_cast<uint32_t>(ticket >> 32);
+        out_ref.offset = static_cast<uint32_t>(ticket & 0xffffffffULL);
+        return true;
+    }
+
     void initialize_persistence_store() {
         persistence_available_ = false;
+        transient_inode_cursor_.store(1, std::memory_order_relaxed);
         root_persistent_ref_ = make_inode_ref(0, 0);
         root_persistent_ref_valid_ = false;
+
+        if (const char* env = std::getenv("LHM_ENABLE_L0_CACHE")) {
+            if (env[0] == '0') {
+                l0_cache_enabled_ = false;
+            } else if (env[0] == '1') {
+                l0_cache_enabled_ = true;
+            }
+        }
 
         if (::mkdir(kPersistenceDir, 0755) != 0 && errno != EEXIST) {
             return;
         }
         if (!persistent_store_.OpenOrCreate(kPersistenceFile)) {
+            return;
+        }
+        if (!persistent_store_.set_l0_cache_enabled(l0_cache_enabled_)) {
+            persistent_store_.Close();
             return;
         }
         persistence_available_ = ensure_root_inode_persisted();
@@ -754,8 +821,12 @@ class LhmNamespace {
         inode_disk root{};
         root.inode_id = packed_inode_id(root_slot);
         root.parent_inode_id = 0;
-        root.primary_ref = make_inode_ref(0, 0);
-        root.aux_ref = make_inode_ref(0, 0);
+        inode_ref root_dir_head = make_inode_ref(0, 0);
+        if (!persistent_store_.CreateDirectoryChain(root.inode_id, root_dir_head)) {
+            return false;
+        }
+        root.primary_ref = root_dir_head;
+        root.aux_ref = root_dir_head;
         root.ctime_ns = now_ns();
         root.mtime_ns = root.ctime_ns;
         root.tombstone_epoch = 0;
@@ -910,6 +981,14 @@ class LhmNamespace {
         inode.parent_inode_id = packed_inode_id(parent_ref);
         inode.primary_ref = persistent_ref;
         inode.aux_ref = make_inode_ref(0, 0);
+        if (kind == entry_kind::directory) {
+            inode_ref dir_head = make_inode_ref(0, 0);
+            if (!persistent_store_.CreateDirectoryChain(inode.inode_id, dir_head)) {
+                return false;
+            }
+            inode.primary_ref = dir_head;
+            inode.aux_ref = dir_head;
+        }
         inode.ctime_ns = ts;
         inode.mtime_ns = ts;
         inode.tombstone_epoch = 0;

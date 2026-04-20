@@ -1,5 +1,6 @@
 #include "persistent_store.hh"
 
+#include <algorithm>
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>
@@ -74,13 +75,22 @@ off_t block_offset(uint32_t block_id) {
 
 }  // namespace
 
+thread_local PersistentStore::inode_chunk_cache PersistentStore::tls_inode_chunk_{};
+thread_local PersistentStore::l0_tls_handle PersistentStore::tls_l0_handle_{};
+
 PersistentStore::PersistentStore()
-    : fd_(-1), next_alloc_block_(1), sequence_(1),
-      active_inode_block_id_(0), next_inode_slot_index_(0) {
+    : fd_(-1), next_alloc_block_(1), sequence_(1), next_inode_ticket_(0),
+      highest_initialized_inode_block_(0), inode_alloc_epoch_(1), l0_epoch_(1),
+      l0_cache_enabled_(true) {
 }
 
 PersistentStore::~PersistentStore() {
     Close();
+    std::lock_guard<std::mutex> guard(l0_buffers_mu_);
+    for (l0_thread_buffer* buf : l0_buffers_) {
+        delete buf;
+    }
+    l0_buffers_.clear();
 }
 
 bool PersistentStore::OpenOrCreate(const std::string& path) {
@@ -93,10 +103,14 @@ bool PersistentStore::OpenOrCreate(const std::string& path) {
 
     fd_ = fd;
     path_ = path;
-    next_alloc_block_ = 1;
+    next_alloc_block_.store(1, std::memory_order_relaxed);
     sequence_ = 1;
-    active_inode_block_id_ = 0;
-    next_inode_slot_index_ = 0;
+    next_inode_ticket_.store(0, std::memory_order_relaxed);
+    highest_initialized_inode_block_.store(0, std::memory_order_relaxed);
+    inode_alloc_epoch_.fetch_add(1, std::memory_order_relaxed);
+    l0_epoch_.fetch_add(1, std::memory_order_relaxed);
+    ResetAllL0Buffers();
+    ResetInodeCache();
 
     struct stat st;
     if (::fstat(fd_, &st) != 0) {
@@ -121,14 +135,23 @@ bool PersistentStore::OpenOrCreate(const std::string& path) {
 
 void PersistentStore::Close() {
     if (fd_ >= 0) {
+        if (l0_cache_enabled_.load(std::memory_order_relaxed)) {
+            (void) FlushAllL0Buffers();
+        }
+        (void) FlushInodeCache();
+        (void) ::fsync(fd_);
         ::close(fd_);
         fd_ = -1;
     }
+    l0_epoch_.fetch_add(1, std::memory_order_relaxed);
+    ResetAllL0Buffers();
+    ResetInodeCache();
     path_.clear();
-    next_alloc_block_ = 1;
+    next_alloc_block_.store(1, std::memory_order_relaxed);
     sequence_ = 1;
-    active_inode_block_id_ = 0;
-    next_inode_slot_index_ = 0;
+    next_inode_ticket_.store(0, std::memory_order_relaxed);
+    highest_initialized_inode_block_.store(0, std::memory_order_relaxed);
+    inode_alloc_epoch_.fetch_add(1, std::memory_order_relaxed);
 }
 
 bool PersistentStore::IsOpen() const {
@@ -139,7 +162,37 @@ bool PersistentStore::Sync() {
     if (!IsOpen()) {
         return false;
     }
+    if (l0_cache_enabled_.load(std::memory_order_relaxed)) {
+        if (!FlushAllL0Buffers()) {
+            return false;
+        }
+    }
+    if (!FlushInodeCache()) {
+        return false;
+    }
     return ::fsync(fd_) == 0;
+}
+
+bool PersistentStore::set_l0_cache_enabled(bool enabled) {
+    const bool old = l0_cache_enabled_.exchange(enabled, std::memory_order_relaxed);
+    if (old == enabled) {
+        return true;
+    }
+    if (!enabled) {
+        if (IsOpen() && !FlushAllL0Buffers()) {
+            l0_cache_enabled_.store(old, std::memory_order_relaxed);
+            return false;
+        }
+        ResetAllL0Buffers();
+        l0_epoch_.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        l0_epoch_.fetch_add(1, std::memory_order_relaxed);
+    }
+    return true;
+}
+
+bool PersistentStore::l0_cache_enabled() const {
+    return l0_cache_enabled_.load(std::memory_order_relaxed);
 }
 
 bool PersistentStore::ReadBlock(uint32_t block_id, metadata_block_bytes& out) const {
@@ -172,6 +225,15 @@ bool PersistentStore::WriteBlock(uint32_t block_id, const metadata_block_bytes& 
     std::memcpy(aligned, data.data(), kMetadataBlockBytes);
     bool ok = pwrite_all(fd_, aligned, kMetadataBlockBytes, block_offset(block_id));
     ::free(aligned);
+    if (ok) {
+        uint32_t need = block_id + 1;
+        uint32_t cur = next_alloc_block_.load(std::memory_order_relaxed);
+        while (cur < need
+               && !next_alloc_block_.compare_exchange_weak(cur, need,
+                                                           std::memory_order_relaxed,
+                                                           std::memory_order_relaxed)) {
+        }
+    }
     return ok;
 }
 
@@ -179,8 +241,8 @@ bool PersistentStore::AllocateBlock(uint32_t& out_block_id) {
     if (!IsOpen()) {
         return false;
     }
-    out_block_id = next_alloc_block_++;
-    return EnsureBlockCount(next_alloc_block_);
+    std::lock_guard<std::mutex> guard(inode_alloc_mu_);
+    return AllocateBlockLocked(out_block_id);
 }
 
 bool PersistentStore::ReadSuperblock(superblock_payload& out) const {
@@ -264,90 +326,62 @@ bool PersistentStore::WriteAllocatorState(uint32_t block_id,
 }
 
 bool PersistentStore::ReadInodeBlock(uint32_t block_id, inode_block_image& out) const {
-    metadata_block_bytes block;
-    if (!ReadBlock(block_id, block)) {
+    if (!IsOpen()) {
         return false;
     }
-    std::memcpy(&out, block.data(), sizeof(out));
-    if (out.common.magic != kMetadataMagic
-        || out.common.block_type != static_cast<uint16_t>(metadata_block_type::inode_block)) {
-        return false;
+
+    const std::size_t shard_idx = InodeCacheShardIndex(block_id);
+    const std::size_t slot_idx = InodeCacheSlotIndex(block_id);
+    inode_block_cache_shard& shard = inode_block_cache_[shard_idx];
+    {
+        std::lock_guard<std::mutex> guard(shard.mu);
+        const inode_block_cache_entry& entry = shard.entries[slot_idx];
+        if (entry.valid && entry.block_id == block_id) {
+            out = entry.image;
+            return true;
+        }
     }
-    return true;
+
+    return ReadInodeBlockDirect(block_id, out);
 }
 
 bool PersistentStore::WriteInodeBlock(uint32_t block_id, const inode_block_image& image) {
-    metadata_block_bytes block{};
-    std::memcpy(block.data(), &image, sizeof(image));
-    return WriteBlock(block_id, block);
+    if (!IsOpen()) {
+        return false;
+    }
+
+    const std::size_t shard_idx = InodeCacheShardIndex(block_id);
+    const std::size_t slot_idx = InodeCacheSlotIndex(block_id);
+    inode_block_cache_shard& shard = inode_block_cache_[shard_idx];
+    std::lock_guard<std::mutex> guard(shard.mu);
+
+    inode_block_cache_entry& entry = shard.entries[slot_idx];
+    if (entry.valid && entry.block_id != block_id) {
+        if (!FlushInodeCacheEntryLocked(shard, slot_idx)) {
+            return false;
+        }
+    }
+    entry.valid = true;
+    entry.dirty = true;
+    entry.block_id = block_id;
+    entry.image = image;
+    SetShardDirtyBit(shard, slot_idx, true);
+    return true;
 }
 
 bool PersistentStore::AllocateInodeSlot(inode_ref& out_ref) {
     if (!IsOpen()) {
         return false;
     }
-    // 线性分配策略：
-    // 1) 当前 inode 块未满则直接取 next slot；
-    // 2) 当前块满/不存在时新建一个 inode 块继续顺序分配；
-    // 3) 不做全表扫描与空洞复用。
-    if (active_inode_block_id_ == 0 || next_inode_slot_index_ >= kInodesPerBlock) {
-        uint32_t new_block = 0;
-        if (!AllocateBlock(new_block)) {
-            return false;
-        }
-
-        inode_block_image fresh{};
-        BuildCommonHeader(fresh.common, metadata_block_type::inode_block, new_block,
-                          sizeof(inode_block_header) + kInodesPerBlock * sizeof(inode_disk),
-                          sequence_++, 0, 0, 0);
-        fresh.header.slot_count = kInodesPerBlock;
-        fresh.header.used_count = 0;
-        fresh.header.flags = 0;
-        fresh.header.reserved0 = 0;
-        fresh.header.alloc_epoch = sequence_;
-        std::memset(fresh.header.slot_bitmap, 0, sizeof(fresh.header.slot_bitmap));
-        std::memset(fresh.slots, 0, sizeof(fresh.slots));
-        if (!WriteInodeBlock(new_block, fresh)) {
-            return false;
-        }
-        active_inode_block_id_ = new_block;
-        next_inode_slot_index_ = 0;
-    }
-
-    inode_block_image image;
-    if (!ReadInodeBlock(active_inode_block_id_, image)) {
+    uint64_t begin = 0;
+    uint64_t end = 0;
+    if (!AcquireInodeTicketRange(begin, end)) {
         return false;
     }
-
-    uint32_t slot = next_inode_slot_index_;
-    if (slot >= kInodesPerBlock) {
-        active_inode_block_id_ = 0;
-        next_inode_slot_index_ = 0;
-        return AllocateInodeSlot(out_ref);
-    }
-    if (IsSlotUsed(image.header, slot)) {
-        // 只在块内向前探测，避免全表扫描；出现异常时继续线性推进。
-        while (slot < kInodesPerBlock && IsSlotUsed(image.header, slot)) {
-            ++slot;
-        }
-        if (slot >= kInodesPerBlock) {
-            active_inode_block_id_ = 0;
-            next_inode_slot_index_ = 0;
-            return AllocateInodeSlot(out_ref);
-        }
-    }
-
-    SetSlotUsed(image.header, slot, true);
-    if (image.header.used_count <= slot) {
-        image.header.used_count = slot + 1;
-    }
-    std::memset(&image.slots[slot], 0, sizeof(inode_disk));
-    if (!WriteInodeBlock(active_inode_block_id_, image)) {
+    if (begin >= end) {
         return false;
     }
-
-    out_ref = make_inode_ref(active_inode_block_id_, slot);
-    next_inode_slot_index_ = slot + 1;
+    out_ref = make_inode_ref(InodeBlockIdFromTicket(begin), InodeSlotFromTicket(begin));
     return true;
 }
 
@@ -355,11 +389,34 @@ bool PersistentStore::ReadInode(const inode_ref& ref, inode_disk& out) const {
     if (ref.offset >= kInodesPerBlock) {
         return false;
     }
-    inode_block_image image;
-    if (!ReadInodeBlock(ref.block_id, image)) {
+    if (!IsOpen()) {
         return false;
     }
-    if (!IsSlotUsed(image.header, ref.offset)) {
+
+    if (l0_cache_enabled_.load(std::memory_order_relaxed)) {
+        if (l0_thread_buffer* l0 = GetL0ThreadBufferIfValid()) {
+            std::lock_guard<std::mutex> l0_guard(l0->mu);
+            if (l0->has_active_block && l0->active_block_id == ref.block_id) {
+                out = l0->active_image.slots[ref.offset];
+                return true;
+            }
+        }
+    }
+
+    const std::size_t shard_idx = InodeCacheShardIndex(ref.block_id);
+    const std::size_t slot_idx = InodeCacheSlotIndex(ref.block_id);
+    inode_block_cache_shard& shard = inode_block_cache_[shard_idx];
+    {
+        std::lock_guard<std::mutex> guard(shard.mu);
+        const inode_block_cache_entry& entry = shard.entries[slot_idx];
+        if (entry.valid && entry.block_id == ref.block_id) {
+            out = entry.image.slots[ref.offset];
+            return true;
+        }
+    }
+
+    inode_block_image image;
+    if (!ReadInodeBlockDirect(ref.block_id, image)) {
         return false;
     }
     out = image.slots[ref.offset];
@@ -370,15 +427,81 @@ bool PersistentStore::WriteInode(const inode_ref& ref, const inode_disk& inode) 
     if (ref.offset >= kInodesPerBlock) {
         return false;
     }
-    inode_block_image image;
-    if (!ReadInodeBlock(ref.block_id, image)) {
+    if (!IsOpen()) {
         return false;
     }
-    if (!IsSlotUsed(image.header, ref.offset)) {
-        return false;
+
+    if (l0_cache_enabled_.load(std::memory_order_relaxed)) {
+        l0_thread_buffer* l0 = GetOrCreateL0ThreadBuffer();
+        if (!l0) {
+            return false;
+        }
+        std::lock_guard<std::mutex> l0_guard(l0->mu);
+
+        if (!l0->has_active_block || l0->active_block_id != ref.block_id) {
+            if (!FlushL0ThreadBufferLocked(*l0, false)) {
+                return false;
+            }
+
+            inode_block_image loaded{};
+            if (!ReadInodeBlock(ref.block_id, loaded)) {
+                return false;
+            }
+            l0->has_active_block = true;
+            l0->active_dirty = false;
+            l0->active_block_id = ref.block_id;
+            l0->pending_ops = 0;
+            l0->active_image = loaded;
+        }
+
+        const bool was_used = IsSlotUsed(l0->active_image.header, ref.offset);
+        l0->active_image.slots[ref.offset] = inode;
+        SetSlotUsed(l0->active_image.header, ref.offset, true);
+        if (!was_used && l0->active_image.header.used_count < kInodesPerBlock) {
+            ++l0->active_image.header.used_count;
+        }
+        l0->active_dirty = true;
+        ++l0->pending_ops;
+        if (l0->pending_ops >= kL0FlushOpsThreshold
+            || l0->active_image.header.used_count >= kInodesPerBlock) {
+            if (!FlushL0ThreadBufferLocked(*l0, true)) {
+                return false;
+            }
+        }
+        return true;
     }
-    image.slots[ref.offset] = inode;
-    return WriteInodeBlock(ref.block_id, image);
+
+    const std::size_t shard_idx = InodeCacheShardIndex(ref.block_id);
+    const std::size_t slot_idx = InodeCacheSlotIndex(ref.block_id);
+    inode_block_cache_shard& shard = inode_block_cache_[shard_idx];
+    std::lock_guard<std::mutex> guard(shard.mu);
+
+    inode_block_cache_entry& entry = shard.entries[slot_idx];
+    if (!entry.valid || entry.block_id != ref.block_id) {
+        if (entry.valid && entry.block_id != ref.block_id) {
+            if (!FlushInodeCacheEntryLocked(shard, slot_idx)) {
+                return false;
+            }
+        }
+        inode_block_image loaded{};
+        if (!ReadInodeBlockDirect(ref.block_id, loaded)) {
+            return false;
+        }
+        entry.valid = true;
+        entry.dirty = false;
+        entry.block_id = ref.block_id;
+        entry.image = loaded;
+    }
+
+    const bool was_used = IsSlotUsed(entry.image.header, ref.offset);
+    entry.image.slots[ref.offset] = inode;
+    SetSlotUsed(entry.image.header, ref.offset, true);
+    if (!was_used && entry.image.header.used_count < kInodesPerBlock) {
+        ++entry.image.header.used_count;
+    }
+    entry.dirty = true;
+    SetShardDirtyBit(shard, slot_idx, true);
+    return true;
 }
 
 bool PersistentStore::ReadDirectoryBlock(uint32_t block_id, directory_block_image& out) const {
@@ -401,8 +524,73 @@ bool PersistentStore::WriteDirectoryBlock(uint32_t block_id,
     return WriteBlock(block_id, block);
 }
 
+bool PersistentStore::CreateDirectoryChain(uint64_t dir_inode_id, inode_ref& out_head_ref) {
+    out_head_ref = make_inode_ref(0, 0);
+    if (!IsOpen()) {
+        return false;
+    }
+
+    std::lock_guard<std::mutex> guard(inode_alloc_mu_);
+    uint32_t block_id = 0;
+    if (!AllocateBlockLocked(block_id)) {
+        return false;
+    }
+
+    directory_block_image image{};
+    InitDirectoryBlockImage(image, block_id, dir_inode_id, 0, 0, 1, NextSequenceLocked());
+    if (!WriteDirectoryBlock(block_id, image)) {
+        return false;
+    }
+
+    out_head_ref = make_inode_ref(block_id, 0);
+    return true;
+}
+
+bool PersistentStore::AppendDirectoryChainBlock(const inode_ref& tail_ref,
+                                                uint64_t dir_inode_id,
+                                                inode_ref& out_new_tail_ref) {
+    out_new_tail_ref = make_inode_ref(0, 0);
+    if (!IsOpen() || tail_ref.block_id == 0 || tail_ref.offset != 0) {
+        return false;
+    }
+
+    std::lock_guard<std::mutex> guard(inode_alloc_mu_);
+
+    directory_block_image tail{};
+    if (!ReadDirectoryBlock(tail_ref.block_id, tail)) {
+        return false;
+    }
+    if (tail.header.dir_inode_id != dir_inode_id) {
+        return false;
+    }
+    if (tail.header.next_block_id != 0) {
+        return false;
+    }
+
+    uint32_t new_block_id = 0;
+    if (!AllocateBlockLocked(new_block_id)) {
+        return false;
+    }
+
+    directory_block_image fresh{};
+    InitDirectoryBlockImage(fresh, new_block_id, dir_inode_id, tail_ref.block_id, 0,
+                            tail.header.base_version, NextSequenceLocked());
+    if (!WriteDirectoryBlock(new_block_id, fresh)) {
+        return false;
+    }
+
+    tail.header.next_block_id = new_block_id;
+    tail.common.sequence = NextSequenceLocked();
+    if (!WriteDirectoryBlock(tail_ref.block_id, tail)) {
+        return false;
+    }
+
+    out_new_tail_ref = make_inode_ref(new_block_id, 0);
+    return true;
+}
+
 uint32_t PersistentStore::NextAllocBlock() const {
-    return next_alloc_block_;
+    return next_alloc_block_.load(std::memory_order_relaxed);
 }
 
 const std::string& PersistentStore::BackingFile() const {
@@ -437,10 +625,10 @@ bool PersistentStore::InitializeFreshStore() {
         return false;
     }
 
-    next_alloc_block_ = 1;
+    next_alloc_block_.store(1, std::memory_order_relaxed);
     sequence_ = 1;
-    active_inode_block_id_ = 0;
-    next_inode_slot_index_ = 0;
+    next_inode_ticket_.store(0, std::memory_order_relaxed);
+    highest_initialized_inode_block_.store(0, std::memory_order_relaxed);
     return true;
 }
 
@@ -455,13 +643,13 @@ bool PersistentStore::RecomputeNextAllocBlock() {
     uint64_t bytes = static_cast<uint64_t>(st.st_size);
     uint64_t blocks = (bytes + kMetadataBlockBytes - 1) / kMetadataBlockBytes;
     if (blocks == 0) {
-        next_alloc_block_ = 1;
+        next_alloc_block_.store(1, std::memory_order_relaxed);
         return InitializeFreshStore();
     }
     if (blocks > UINT32_MAX) {
         return false;
     }
-    next_alloc_block_ = static_cast<uint32_t>(blocks);
+    next_alloc_block_.store(static_cast<uint32_t>(blocks), std::memory_order_relaxed);
 
     // 确认 block0 是 superblock，否则拒绝加载。
     metadata_block_bytes block0;
@@ -478,11 +666,12 @@ bool PersistentStore::RecomputeNextAllocBlock() {
 }
 
 bool PersistentStore::RecomputeLinearInodeCursor() {
-    active_inode_block_id_ = 0;
-    next_inode_slot_index_ = 0;
+    uint64_t next_ticket = 0;
+    uint32_t highest_inode_block = 0;
 
     // 启动阶段允许一次线性扫描，用于恢复“最后一个 inode block + 下一个 slot”游标。
-    for (uint32_t b = 1; b < next_alloc_block_; ++b) {
+    const uint32_t total_blocks = next_alloc_block_.load(std::memory_order_relaxed);
+    for (uint32_t b = 1; b < total_blocks; ++b) {
         metadata_block_bytes raw;
         if (!ReadBlock(b, raw)) {
             continue;
@@ -498,14 +687,320 @@ bool PersistentStore::RecomputeLinearInodeCursor() {
         if (!ReadInodeBlock(b, image)) {
             return false;
         }
-        active_inode_block_id_ = b;
+        highest_inode_block = std::max(highest_inode_block, b);
         uint32_t used = image.header.used_count;
         if (used > kInodesPerBlock) {
             used = kInodesPerBlock;
         }
-        next_inode_slot_index_ = used;
+        uint64_t candidate =
+            static_cast<uint64_t>(b - 1) * static_cast<uint64_t>(kInodesPerBlock)
+            + static_cast<uint64_t>(used);
+        if (candidate > next_ticket) {
+            next_ticket = candidate;
+        }
+    }
+    next_inode_ticket_.store(next_ticket, std::memory_order_relaxed);
+    highest_initialized_inode_block_.store(highest_inode_block, std::memory_order_relaxed);
+    return true;
+}
+
+bool PersistentStore::AllocateBlockLocked(uint32_t& out_block_id) {
+    out_block_id = next_alloc_block_.load(std::memory_order_relaxed);
+    next_alloc_block_.store(out_block_id + 1, std::memory_order_relaxed);
+    return EnsureBlockCount(out_block_id + 1);
+}
+
+uint64_t PersistentStore::NextSequenceLocked() {
+    return sequence_++;
+}
+
+void PersistentStore::InitDirectoryBlockImage(directory_block_image& out,
+                                              uint32_t block_id,
+                                              uint64_t dir_inode_id,
+                                              uint32_t prev_block_id,
+                                              uint32_t next_block_id,
+                                              uint64_t base_version,
+                                              uint64_t sequence) {
+    std::memset(&out, 0, sizeof(out));
+    BuildCommonHeader(out.common, metadata_block_type::directory_block, block_id,
+                      sizeof(directory_block_header), sequence,
+                      dir_inode_id, next_block_id, 0);
+    out.header.dir_inode_id = dir_inode_id;
+    out.header.entry_count = 0;
+    out.header.used_bytes = 0;
+    out.header.base_version = base_version;
+    out.header.prev_block_id = prev_block_id;
+    out.header.next_block_id = next_block_id;
+    out.header.delta_count = 0;
+    out.header.flags = 0;
+    std::memset(out.header.reserved, 0, sizeof(out.header.reserved));
+    std::memset(out.payload, 0, sizeof(out.payload));
+}
+
+bool PersistentStore::EnsureInodeBlocksInitializedLocked(uint32_t target_block_id) {
+    uint32_t initialized = highest_initialized_inode_block_.load(std::memory_order_relaxed);
+    while (initialized < target_block_id) {
+        const uint32_t block_id = initialized + 1;
+        inode_block_image fresh{};
+        BuildCommonHeader(fresh.common, metadata_block_type::inode_block, block_id,
+                          sizeof(inode_block_header) + kInodesPerBlock * sizeof(inode_disk),
+                          NextSequenceLocked(), 0, 0, 0);
+        fresh.header.slot_count = kInodesPerBlock;
+        fresh.header.used_count = 0;
+        fresh.header.flags = 0;
+        fresh.header.reserved0 = 0;
+        fresh.header.alloc_epoch = sequence_;
+        std::memset(fresh.header.slot_bitmap, 0, sizeof(fresh.header.slot_bitmap));
+        std::memset(fresh.slots, 0, sizeof(fresh.slots));
+        if (!WriteInodeBlock(block_id, fresh)) {
+            return false;
+        }
+        initialized = block_id;
+    }
+    highest_initialized_inode_block_.store(initialized, std::memory_order_relaxed);
+    return true;
+}
+
+bool PersistentStore::AcquireInodeTicketRange(uint64_t& begin_ticket, uint64_t& end_ticket) {
+    begin_ticket = 0;
+    end_ticket = 0;
+    if (!IsOpen()) {
+        return false;
+    }
+
+    inode_chunk_cache& tls = tls_inode_chunk_;
+    const uint64_t epoch = inode_alloc_epoch_.load(std::memory_order_relaxed);
+    if (tls.owner != this || tls.epoch != epoch || tls.next_ticket >= tls.end_ticket) {
+        const uint64_t begin =
+            next_inode_ticket_.fetch_add(kInodeAllocChunk, std::memory_order_relaxed);
+        const uint64_t end = begin + kInodeAllocChunk;
+        if (end <= begin) {
+            return false;
+        }
+
+        const uint32_t target_block_id = InodeBlockIdFromTicket(end - 1);
+        {
+            std::lock_guard<std::mutex> guard(inode_alloc_mu_);
+            if (!EnsureInodeBlocksInitializedLocked(target_block_id)) {
+                return false;
+            }
+        }
+
+        tls.owner = this;
+        tls.epoch = epoch;
+        tls.next_ticket = begin;
+        tls.end_ticket = end;
+    }
+
+    begin_ticket = tls.next_ticket;
+    end_ticket = tls.end_ticket;
+    ++tls.next_ticket;
+    return true;
+}
+
+PersistentStore::l0_thread_buffer* PersistentStore::GetOrCreateL0ThreadBuffer() {
+    const uint64_t epoch = l0_epoch_.load(std::memory_order_relaxed);
+    l0_tls_handle& tls = tls_l0_handle_;
+    if (tls.owner == this && tls.epoch == epoch && tls.buffer != nullptr) {
+        return tls.buffer;
+    }
+
+    if (tls.owner == this && tls.buffer != nullptr) {
+        std::lock_guard<std::mutex> buf_guard(tls.buffer->mu);
+        tls.buffer->has_active_block = false;
+        tls.buffer->active_dirty = false;
+        tls.buffer->active_block_id = 0;
+        tls.buffer->pending_ops = 0;
+        std::memset(&tls.buffer->active_image, 0, sizeof(tls.buffer->active_image));
+        tls.epoch = epoch;
+        return tls.buffer;
+    }
+
+    l0_thread_buffer* fresh = new l0_thread_buffer();
+    {
+        std::lock_guard<std::mutex> guard(l0_buffers_mu_);
+        l0_buffers_.push_back(fresh);
+    }
+    tls.owner = this;
+    tls.epoch = epoch;
+    tls.buffer = fresh;
+    return fresh;
+}
+
+PersistentStore::l0_thread_buffer* PersistentStore::GetL0ThreadBufferIfValid() const {
+    const uint64_t epoch = l0_epoch_.load(std::memory_order_relaxed);
+    l0_tls_handle& tls = tls_l0_handle_;
+    if (tls.owner == this && tls.epoch == epoch && tls.buffer != nullptr) {
+        return tls.buffer;
+    }
+    return nullptr;
+}
+
+bool PersistentStore::FlushL0ThreadBufferLocked(l0_thread_buffer& buffer, bool keep_active_block) {
+    if (buffer.has_active_block && buffer.active_dirty) {
+        if (!WriteInodeBlock(buffer.active_block_id, buffer.active_image)) {
+            return false;
+        }
+    }
+    buffer.active_dirty = false;
+    buffer.pending_ops = 0;
+    if (!keep_active_block) {
+        buffer.has_active_block = false;
+        buffer.active_block_id = 0;
+        std::memset(&buffer.active_image, 0, sizeof(buffer.active_image));
     }
     return true;
+}
+
+bool PersistentStore::FlushAllL0Buffers() {
+    std::vector<l0_thread_buffer*> buffers;
+    {
+        std::lock_guard<std::mutex> guard(l0_buffers_mu_);
+        buffers = l0_buffers_;
+    }
+    for (l0_thread_buffer* buffer : buffers) {
+        if (!buffer) {
+            continue;
+        }
+        std::lock_guard<std::mutex> buf_guard(buffer->mu);
+        if (!FlushL0ThreadBufferLocked(*buffer, true)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void PersistentStore::ResetAllL0Buffers() {
+    std::vector<l0_thread_buffer*> buffers;
+    {
+        std::lock_guard<std::mutex> guard(l0_buffers_mu_);
+        buffers = l0_buffers_;
+    }
+    for (l0_thread_buffer* buffer : buffers) {
+        if (!buffer) {
+            continue;
+        }
+        std::lock_guard<std::mutex> buf_guard(buffer->mu);
+        buffer->has_active_block = false;
+        buffer->active_dirty = false;
+        buffer->active_block_id = 0;
+        buffer->pending_ops = 0;
+        std::memset(&buffer->active_image, 0, sizeof(buffer->active_image));
+    }
+}
+
+bool PersistentStore::ReadInodeBlockDirect(uint32_t block_id, inode_block_image& out) const {
+    metadata_block_bytes block;
+    if (!ReadBlock(block_id, block)) {
+        return false;
+    }
+    std::memcpy(&out, block.data(), sizeof(out));
+    if (out.common.magic != kMetadataMagic
+        || out.common.block_type != static_cast<uint16_t>(metadata_block_type::inode_block)) {
+        return false;
+    }
+    return true;
+}
+
+bool PersistentStore::WriteInodeBlockDirect(uint32_t block_id, const inode_block_image& image) {
+    metadata_block_bytes block{};
+    std::memcpy(block.data(), &image, sizeof(image));
+    return WriteBlock(block_id, block);
+}
+
+bool PersistentStore::FlushInodeCacheEntryLocked(inode_block_cache_shard& shard,
+                                                 std::size_t slot_index) {
+    inode_block_cache_entry& entry = shard.entries[slot_index];
+    if (!entry.valid || !entry.dirty) {
+        SetShardDirtyBit(shard, slot_index, false);
+        return true;
+    }
+    if (!WriteInodeBlockDirect(entry.block_id, entry.image)) {
+        return false;
+    }
+    entry.dirty = false;
+    SetShardDirtyBit(shard, slot_index, false);
+    return true;
+}
+
+bool PersistentStore::FlushInodeCacheShard(std::size_t shard_index) {
+    inode_block_cache_shard& shard = inode_block_cache_[shard_index];
+    std::lock_guard<std::mutex> guard(shard.mu);
+    for (std::size_t slot_index = 0; slot_index < shard.entries.size(); ++slot_index) {
+        if (!IsShardDirtyBitSet(shard, slot_index)) {
+            continue;
+        }
+        if (!FlushInodeCacheEntryLocked(shard, slot_index)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool PersistentStore::FlushInodeCache() {
+    for (std::size_t i = 0; i < inode_block_cache_.size(); ++i) {
+        if (!FlushInodeCacheShard(i)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void PersistentStore::ResetInodeCache() {
+    for (inode_block_cache_shard& shard : inode_block_cache_) {
+        std::lock_guard<std::mutex> guard(shard.mu);
+        for (inode_block_cache_entry& entry : shard.entries) {
+            entry.valid = false;
+            entry.dirty = false;
+            entry.block_id = 0;
+            std::memset(&entry.image, 0, sizeof(entry.image));
+        }
+        shard.dirty_bitmap.fill(0);
+    }
+}
+
+void PersistentStore::SetShardDirtyBit(inode_block_cache_shard& shard,
+                                       std::size_t slot_index,
+                                       bool dirty) {
+    const std::size_t word_index = slot_index / 64;
+    const std::size_t bit_index = slot_index % 64;
+    const uint64_t mask = static_cast<uint64_t>(1) << bit_index;
+    if (dirty) {
+        shard.dirty_bitmap[word_index] |= mask;
+    } else {
+        shard.dirty_bitmap[word_index] &= ~mask;
+    }
+}
+
+bool PersistentStore::IsShardDirtyBitSet(const inode_block_cache_shard& shard,
+                                         std::size_t slot_index) {
+    const std::size_t word_index = slot_index / 64;
+    const std::size_t bit_index = slot_index % 64;
+    const uint64_t mask = static_cast<uint64_t>(1) << bit_index;
+    return (shard.dirty_bitmap[word_index] & mask) != 0;
+}
+
+std::size_t PersistentStore::InodeCacheShardIndex(uint32_t block_id) {
+    static_assert((kInodeCacheShardCount & (kInodeCacheShardCount - 1)) == 0,
+                  "inode cache shard count must be power of two");
+    const uint32_t mixed = block_id * 2654435761u;
+    return static_cast<std::size_t>(mixed & static_cast<uint32_t>(kInodeCacheShardCount - 1));
+}
+
+std::size_t PersistentStore::InodeCacheSlotIndex(uint32_t block_id) {
+    static_assert((kInodeCacheEntriesPerShard & (kInodeCacheEntriesPerShard - 1)) == 0,
+                  "inode cache entries per shard must be power of two");
+    const uint32_t mixed = (block_id ^ (block_id >> 16)) * 2246822519u;
+    return static_cast<std::size_t>(
+        (mixed >> 1) & static_cast<uint32_t>(kInodeCacheEntriesPerShard - 1));
+}
+
+uint32_t PersistentStore::InodeBlockIdFromTicket(uint64_t ticket) {
+    return 1u + static_cast<uint32_t>(ticket / static_cast<uint64_t>(kInodesPerBlock));
+}
+
+uint32_t PersistentStore::InodeSlotFromTicket(uint64_t ticket) {
+    return static_cast<uint32_t>(ticket % static_cast<uint64_t>(kInodesPerBlock));
 }
 
 bool PersistentStore::IsKnownBlockType(uint16_t block_type) const {

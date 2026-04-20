@@ -91,16 +91,82 @@ LHM 的当前目标是：
 - `persistent_store` 已接入，后端文件：`/mnt/batchtest/lhm/lhm_namespace.meta`；
 - 采用 `O_DIRECT` + 16KB 固定块 I/O；
 - 已实现：`superblock`、inode block 读写、directory block 读写、顺序块分配；
+- 已实现目录块链基础接口：
+  - `CreateDirectoryChain(dir_inode_id)`：创建目录链头空块；
+  - `AppendDirectoryChainBlock(tail_ref, dir_inode_id)`：为目录链追加新块并维护 `prev/next`。
 - 根目录 inode 已持久化并在内存中缓存 `root_persistent_ref`。
 
 ### 5.1 inode 分配策略（最新）
 
-- 已从“每次分配全表线性扫描”改为“线性顺序分配”；
-- 运行时只维护：
-  - `active_inode_block_id`
-  - `next_inode_slot_index`
-- 单次 `AllocateInodeSlot` 不再扫描历史 inode blocks；
-- 仅在 `OpenOrCreate` 时做一次游标重建扫描（恢复下一分配位置）。
+- 已从“线性游标 + 每次块级读改写”切换为：
+  - `global atomic ticket` 发号；
+  - `TLS chunk` 本地缓存（每线程一次领取 256 个 ticket）；
+  - `inode_alloc_epoch` 生命周期代次校验（防止线程误用旧缓存）。
+- ticket 到槽位映射：
+  - `block_id = 1 + ticket / kInodesPerBlock`
+  - `slot = ticket % kInodesPerBlock`
+- 新 inode block 初始化策略：
+  - 仅在线程 refill chunk 时检查并按需初始化；
+  - 初始化路径受互斥保护，避免并发重复建块；
+  - 常规分配路径不再做每次 inode block 的 RMW。
+- `OpenOrCreate` 启动阶段仍保留一次线性扫描，用于恢复 `next_inode_ticket` 游标。
+
+### 5.2 `L0 + L1` 缓存模型（本轮新增）
+
+当前持久化写路径采用两级缓存：
+
+1. `L0`（线程局部缓冲，cold-start 优先）
+- 每线程一个活动 inode block 缓冲（16KB）；
+- 作用：将同线程连续 inode 写（create/delete）先聚合在 L0，减少每次操作触发 L1 锁路径；
+- 字段：`has_active_block / active_dirty / active_block_id / pending_ops / active_image`；
+- flush 触发：
+  - 活动块切换；
+  - `pending_ops >= 64`；
+  - `Sync/Close` 全局强制 flush。
+- 运行开关（新增）：
+  - `LhmNamespace::set_l0_cache_enabled(bool)`；
+  - 环境变量 `LHM_ENABLE_L0_CACHE=0/1`（初始化时读取）。
+
+2. `L1`（共享固定大小 cache，steady-state 优先）
+- `PersistentStore` 内 **sharded inode block cache**：
+  - `kInodeCacheShardCount = 8`
+  - `kInodeCacheEntriesPerShard = 64`
+  - 总缓存槽位 `8 * 64 = 512` 个 inode block（每个 16KB）
+- 每个 shard 一把锁（`shard.mu`）；
+- 每个 shard 维护 `dirty_bitmap`；
+- slot 字段：`valid / dirty / block_id / image`。
+
+### 5.3 刷新与持久化边界（更新）
+
+- `WriteInode` 默认先写 `L0`，再由 `L0` 下发到 `L1`；
+- `L1` 脏块不立即落盘，按位图延迟刷盘；
+- `Sync()` 顺序：
+  1. flush 所有 `L0` 线程缓冲到 `L1`；
+  2. flush `L1` 脏 inode block 到 SSD；
+  3. `fsync(fd)`。
+- `Close()` 顺序与 `Sync()` 一致，随后 reset 缓冲状态。
+
+### 5.4 `ReadInode` / `WriteInode` 路径（更新）
+
+`ReadInode(ref)`：
+
+1. 先查当前线程 `L0`（若 `active_block_id == ref.block_id`，直接返回）；
+2. 否则查 `L1` shard/slot 命中；
+3. 再不命中则 direct read SSD。
+
+`WriteInode(ref, inode)`：
+
+1. 获取当前线程 `L0` 缓冲；
+2. 若目标 `block_id` 与活动块不同，先 flush 当前 `L0` 活动块到 `L1`，再加载新块；
+3. 在 `L0` 内更新 inode slot + `slot_bitmap/used_count`；
+4. 置 `active_dirty=true`，累计 `pending_ops`；
+5. 触发阈值时将 `L0` 活动块下发到 `L1`（不直接下盘）。
+
+若关闭 `L0`（`set_l0_cache_enabled(false)`）：
+
+1. `WriteInode` 直接走 `L1` shard 缓存路径；
+2. `Sync/Close` 不再执行 `L0` flush，仅刷 `L1`；
+3. 用于“常规稳态测试只测 L1”场景。
 
 ---
 
@@ -130,11 +196,12 @@ LHM 的当前目标是：
 1. 解析路径并一次性解析父目录上下文：
   - `parent_root`
   - `parent_ref`
-2. 线性分配 inode slot（无全表扫描）；
+2. 分配 inode slot（`global atomic ticket + TLS chunk(256)`）；
 3. 在 `parent_root` 上单次游标创建：
   - 文件：`find_insert` 后插入（不再维护冲突链）；
   - 目录：`create_layer_with_meta`；
 4. 持久化 inode（`persist_create_success`），不再重复查父 inode。
+5. 目录创建时会先创建目录块链头，并将目录 inode 的 `primary_ref/aux_ref` 指向该链头块。
 
 ### 6.4 `delete(path)` / `rmdir(path)`
 
@@ -164,18 +231,38 @@ LHM 的当前目标是：
 - 当前以“结构可持久化 + 路径性能收紧”为主；
 - 已有恢复相关字段预留（`seq/version/checksum/checkpoint refs`）；
 - 完整崩溃恢复流程（replay/rebuild/orphan cleanup）尚未实现。
+- `L0` 适用前提：
+  - 冷启动阶段由上层负载分配保证“同目录主要由同线程写”；
+  - 若出现跨线程同目录并发写，仍需依赖上层路由/语义约束，`L0` 本身不提供跨线程目录序列化。
+- 若线程在 `Sync/Close` 前退出：
+  - `L0` 缓冲通过全局注册表在 `Sync/Close` 统一 flush；
+  - 但若进程崩溃，仍以已下发到 `L1/SSD` 的数据为准。
 
 ---
 
 ## 8. 本轮性能相关改动摘要
 
 - inode 分配：全表扫描 -> 线性顺序分配；
+- inode 分配并发：线性顺序游标 -> `global atomic + TLS chunk(256)`；
 - `stat`：双遍历 -> 父目录一次定位 + 一次孩子槽位查询；
 - `create/mkdir`：去掉重复父目录查找与重复父 inode 查找；
 - 删除冲突桶路径：不再维护 `conflict_bucket/conflict_chain`；
 - `create` 持久化：去掉创建后额外 inode 读取；
 - `ls`：保持当前层扫描，不下钻；
 - `delete` 测试路径：去掉预先 `lookup`。
+
+### 8.1 并发测试快照（iwide, release, create+delete）
+
+- 参数：`threads=1,2,4,8,16,32`，`ops_per_thread=5000`
+- 改造前吞吐（ops/s）：
+  - `233883, 474742, 864157, 1.649e6, 1.976e6, 2.642e6`
+- 改造后吞吐（ops/s）：
+  - `1.144e6, 2.061e6, 3.278e6, 4.171e6, 3.661e6, 5.163e6`
+- 32 线程点位提升：
+  - `2.642e6 -> 5.163e6`（约 `+95.4%`）
+- 结论：
+  - 分配器竞争显著缓解；
+  - 当前高并发写路径的下一瓶颈转移到 `WriteInode` 的块级 RMW。
 
 ---
 
